@@ -1,0 +1,1542 @@
+#!/usr/bin/perl -l
+#
+# Copyright 2020 Gauthier Voron
+#
+# This program is free software: you can redistribute it and/or modify it under
+# the terms of the GNU General Public License as published by the Free Software
+# Foundation, either version 3 of the License, or (at your option) any later
+# version.
+#
+# This program is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for
+# more details.
+#
+# You should have received a copy of the GNU General Public License along with
+# this program. If not, see <https://www.gnu.org/licenses/>.
+#
+
+use strict;
+use warnings;
+
+use Digest::MD5;
+use File::Copy ();
+use File::Temp qw(tempfile);
+use File::Which;
+use Getopt::Long qw(GetOptionsFromArray);
+use Text::ParseWords;
+
+
+# The program name, independent of the program file name, as required by GNU
+# specifications.
+#
+my $PROGNAME = 'pacmerge';
+
+# Version of this program with the following scheme.
+#
+#   VERSION = MAJOR . MINOR . VARIANT
+#
+#   MAJOR   => Indicate an interface family. Programs with different MAJOR are
+#              incompatible.
+#
+#   MINOR   => Indicate an interface. For two programs with the same MAJOR
+#              version, the one with the higher MINOR version can be used the
+#              same way than the other but not the reverse.
+#
+#   VARIANT => Indicate an implementation. Two programs who differ only by
+#              their variant can be used the same way but may exhibit
+#              performance or correctness differences.
+#
+my $VERSION  = '1.0.0';
+
+# Credit this person if you like this program.
+#
+my $AUTHOR   = 'Gauthier Voron';
+
+# Complain to this address if you don't like this program.
+#
+my $EMAIL    = 'gauthier.voron@mnesic.fr';
+
+
+# List of editors to try if '--editor' option is not used and EDITOR
+# environment variable is empty or undefied.
+#
+my @EDITORS  = qw(vim emacs nano);
+
+# List of finder commands to try is '--finder' option is not used.
+#
+my @FINDERS  = (
+    [ 'locate' , '.pacnew' ],
+    [ 'find' , '/' , '-name' , '*.pacnew' ]
+    );
+
+
+# Local scope functions =======================================================
+
+
+# Compute the diff between two files and put the result in a third one.
+#
+# Arg 0: The path of the 'old' file to compute the diff from.
+# Arg 1: The path of the 'new' file to compute the diff to.
+# Arg 2: The path of the destination file where to write the diff.
+#
+# Return: The path of the destination file in case of success, undef otherwise.
+#
+sub _diff
+{
+    my ($old, $new, $dest) = @_;
+    my ($ofh, $ifh, $line);
+
+    if (!open($ofh, '>', $dest)) {
+	return undef;
+    }
+
+    if (!open($ifh, '-|', 'diff', '-Naur', $old, $new)) {
+	close($ofh);
+	return undef;
+    }
+
+    while (defined($line = <$ifh>)) {
+	printf($ofh "%s", $line);
+    }
+
+    close($ofh);
+    close($ifh);
+
+    return $dest;
+}
+
+# Compute the diff between two files and put the result in a third one.
+# If no thrid file is specified, create a temporary file and put the result in
+# it before to return the path of this file.
+#
+# Arg 0: The path of the 'old' file to compute the diff from.
+# Arg 1: The path of the 'new' file to compute the diff to.
+# Arg 2: The path of the destination file where to write the diff.
+#
+# Return: The path of the destination file in case of success, undef otherwise.
+#         In case of failure, no temporary file remains after returning undef.
+#
+sub diff
+{
+    my ($old, $new, $dest) = @_;
+    my ($ret);
+
+    if (defined($dest)) {
+	return _diff($old, $new, $dest);
+    }
+
+    ($_, $dest) = tempfile('pacmerge.XXXXXXXXXX', SUFFIX => '.patch',
+			   TMPDIR => 1);
+
+    $ret = _diff($old, $new, $dest);
+
+    if (!$ret) {
+	unlink($dest);
+    }
+
+    return $ret;
+}
+
+# Apply a patch to an original file, putting the result in a third file.
+#
+# Arg 0: The path of the original to apply the patch to.
+# Arg 1: The path of the patch to apply.
+# Arg 2: The path of the file where to write the patch result.
+#
+# Result: The path of the destination file in case of success, undef otherwise.
+#
+sub _patch
+{
+    my ($origin, $patch, $dest) = @_;
+    my ($tfh, $ifh, $ofh, $pid, $line, $ret);
+
+    if (!open($ifh, '<', $patch)) {
+	return undef;
+    }
+
+    if (!pipe($tfh, $ofh)) {
+	close($ifh);
+	return undef;
+    }
+
+    if (($pid = fork()) == 0) {
+	close($ofh);
+	open(\*STDIN, '<&', $tfh);
+
+	exec ('patch', '--silent', '--reject-file=-', 
+	      '--no-backup-if-mismatch', $dest);
+
+	exit (1);
+    }
+
+    while (defined($line = <$ifh>)) {
+	printf($ofh "%s", $line);
+    }
+
+    close($ifh);
+    close($ofh);
+
+    waitpid($pid, 0);
+
+    $ret = ($? >> 8);
+
+    if ($ret != 0) {
+	return undef;
+    }
+
+    return $dest;
+}
+
+# Apply a patch to an original file, putting the result in a third file.
+# If no thrid file is specified, create a temporary file and put the result in
+# it before to return the path of this file.
+#
+# Arg 0: The path of the original to apply the patch to.
+# Arg 1: The path of the patch to apply.
+# Arg 2: The path of the file where to write the patch result.
+#
+# Result: The path of the destination file in case of success, undef otherwise.
+#         In case of failure, no temporary file remains after returning undef.
+#
+sub patch
+{
+    my ($origin, $patch, $dest) = @_;
+    my ($ret);
+
+    if (defined($dest)) {
+	return _patch($origin, $patch, $dest);
+    }
+
+    ($_, $dest) = tempfile('pacmerge.XXXXXXXXXX', TMPDIR => 1);
+    copy($origin, $dest);
+
+    $ret = _patch($origin, $patch, $dest);
+
+    if (!$ret) {
+	unlink($dest);
+    }
+
+    return $ret;
+}
+
+# Copy a file into another one.
+# If only one file is provided, copy this file into a new temporary file and
+# return the path of this new file.
+#
+# Arg 0: The path of the file to copy.
+# Arg 1: The path of the file to put the copy into.
+#
+# Return: The path of the destination file in case of success, undef otherwise.
+#         In case of failure, no temporary file remains after returning undef.
+#
+sub copy
+{
+    my ($src, $dest) = @_;
+    my ($ext);
+
+    if (defined($dest)) {
+	if (File::Copy::copy($src, $dest)) {
+	    return $dest;
+	} else {
+	    return undef;
+	}
+    }
+
+    if ($src =~ m|(\.[^/\.]*)$|) {
+	$ext = $1;
+    }
+
+    ($_, $dest) = tempfile('pacmerge.XXXXXXXXXX', SUFFIX => $ext,
+			   TMPDIR => 1);
+    
+    if (File::Copy::copy($src, $dest)) {
+	return $dest;
+    } else {
+	unlink($dest);
+	return undef;
+    }
+}
+
+# Compute the hash of a file.
+# This has the same effect than `md5sum`.
+#
+# Arg 0: The path of the file to compute the checksum of.
+#
+# Return: The binary (non printable) hash of the content of this file, or undef
+#         in case of failure.
+#
+sub hash
+{
+    my ($path) = @_;
+    my ($fh, $md5, $hash);
+
+    if (!open($fh, '<', $path)) {
+	return undef;
+    }
+
+    $md5 = Digest::MD5->new();
+    $md5->addfile($fh);
+    $hash = $md5->digest();
+
+    close($fh);
+
+    return $hash;
+}
+
+# Print the given file on the standard output.
+#
+# Arg 0: The path of the file to print.
+#
+# Return: 1 if success, undef if failure.
+#
+sub cat
+{
+    my ($path) = @_;
+    my ($fh, $line);
+
+    if (!open($fh, '<', $path)) {
+	return undef;
+    }
+
+    while (defined($line = <$fh>)) {
+	printf("%s", $line);
+    }
+
+    close($fh);
+
+    return 1;
+}
+
+
+# Current view functions ======================================================
+
+# The current view the user interacts with.
+# Implemented by a HASH with the following fields.
+#
+#   ORIGIN => path of the original file
+#
+#   PATCH  => patch to apply to ORIGIN
+#
+#   HASH   => hash of the diff between ORIGIN and ORIGIN.pacnew
+#
+#   STABLE => last stable version of the patch
+#
+#   RESULT => result of patching ORIGIN with PATCH if stable, undef otherwise
+#
+#   STATE  => ''  -> PATCH is the diff between ORIGIN and ORIGIN.pacnew
+#             '*' -> PATCH has been edited but is stable
+#             '!' -> PATCH has beed edited and is unstable
+#
+my $CURRENT_VIEW = undef;
+
+
+# Test if the current view is defined.
+#
+# Return: 1 if the current view is defined, 0 otherwise.
+#
+sub is_current_defined
+{
+    return defined($CURRENT_VIEW);
+}
+
+# Initialize a new current view for the given origin file.
+# If the view is defined before the call, it is terminated first.
+# The new view starts with a clean state '';
+#
+# Arg 0: The path of the origin file.
+#
+# Return: 1
+#
+sub initialize_current
+{
+    my ($origin) = @_;
+
+    if (is_current_defined()) {
+	terminate_current();
+    }
+
+    $CURRENT_VIEW = {
+	ORIGIN => $origin,
+	STATE  => '',
+	PATCH  => undef,
+	STABLE => undef,
+	RESULT => undef,
+	HASH   => undef
+    };
+
+    return 1;
+}
+
+# Terminate the current view.
+# Remove the patch, stable patch and result temporary files if they exist and
+# set the current view to undefined.
+#
+# Return: undef if the view was not defined, 1 otherwise.
+#
+sub terminate_current
+{
+    if (!defined($CURRENT_VIEW)) {
+	return undef;
+    }
+
+    if (defined($CURRENT_VIEW->{PATCH})) {
+	unlink($CURRENT_VIEW->{PATCH});
+    }
+
+    if (defined($CURRENT_VIEW->{STABLE})) {
+	unlink($CURRENT_VIEW->{STABLE});
+    }
+
+    if (defined($CURRENT_VIEW->{RESULT})) {
+	unlink($CURRENT_VIEW->{RESULT});
+    }
+
+    $CURRENT_VIEW = undef;
+
+    return 1;
+}
+
+# Clean the current view.
+# Remove all the files that can be reconstructed.
+# Typically, the result can always be reconstructed from the patch and then is
+# always removed.
+# Decide if a file can be reconstructed by looking at the current view state.
+#
+# Return: 1
+#
+sub clean_current
+{
+    my ($result, $state, $patch, $stable);
+
+    if (defined($result = $CURRENT_VIEW->{RESULT})) {
+	unlink($result);
+	$CURRENT_VIEW->{RESULT} = undef;
+    }
+
+    $state = get_current_state();
+
+    if ($state eq '') {
+	if (defined($patch = $CURRENT_VIEW->{PATCH})) {
+	    unlink($patch);
+	    $CURRENT_VIEW->{PATCH} = undef;
+	    $CURRENT_VIEW->{HASH} = undef;
+	}
+    }
+
+    if (($state eq '') || ($state eq '*')) {
+	if (defined($stable = $CURRENT_VIEW->{STABLE})) {
+	    unlink($stable);
+	    $CURRENT_VIEW->{STABLE} = undef;
+	}
+    }
+
+    return 1;
+}
+
+# Return the current view origin file.
+#
+# Return: The path of the origin file the current view has been initialized
+#         with.
+#
+sub get_current_origin
+{
+    return $CURRENT_VIEW->{ORIGIN};
+}
+
+# Return the current view state
+#
+# Return: The state of the current view.
+#         ''  => The current patch has not been edited.
+#         '*' => The current patch has been edited and is valid.
+#         '!' => The current patch has been edited and is invalid.
+#
+sub get_current_state
+{
+    return $CURRENT_VIEW->{STATE};
+}
+
+# Return the current patch intended for read-only usage.
+# The patch returned by this method should not be edited.
+#
+# Return: The path of the patch to apply to the current view origin file.
+#
+sub get_current_patch_ro
+{
+    my ($patch, $origin, $hash);
+
+    if (defined($patch = $CURRENT_VIEW->{PATCH})) {
+	return $patch;
+    }
+
+    $origin = get_current_origin();
+
+    if (!defined($patch = diff($origin, $origin . '.pacnew'))) {
+	return error("cannot create patch for '$origin' : $!");
+    }
+
+    if (!defined($hash = hash($patch))) {
+	unlink($patch);
+	return error("cannot read patch for '$origin' : $!");
+    }
+
+    $CURRENT_VIEW->{PATCH} = $patch;
+    $CURRENT_VIEW->{HASH} = $hash;
+
+    return $patch;
+}
+
+# Return the current patch intended for read/write usage.
+# If the current view patch is valid (i.e. the current state is not '!'), then
+# it is copied into the current view stable patch before to be returned.
+#
+# Return: The path of the patch to apply to the current view origin file.
+#
+sub get_current_patch_rw
+{
+    my ($patch, $result, $stable, $origin);
+
+    $patch = get_current_patch_ro();
+
+    if (get_current_state() eq '!') {
+	return $patch;
+    }
+
+    if (defined($result = $CURRENT_VIEW->{RESULT})) {
+	unlink($result);
+	$CURRENT_VIEW->{RESULT} = undef;
+    }
+
+    $stable = $CURRENT_VIEW->{STABLE};
+
+    if (!defined($stable = copy($patch, $stable))) {
+	$origin = get_current_origin();
+	return error("cannot save patch for '$origin' : $!");
+    }
+
+    $CURRENT_VIEW->{STABLE} = $stable;
+
+    return $patch;
+}
+
+# Indicate if the current patch is valid.
+# Calling this method updates the current state.
+#
+# Arg 0: 1 if the current patch is valid, 0 otherwise.
+#
+sub validate_current_patch
+{
+    my ($valid) = @_;
+    my ($patch, $hash, $origin, $stable);
+
+    if ($valid == 0) {
+	$CURRENT_VIEW->{STATE} = '!';
+	return 1;
+    }
+
+    if (!defined($patch = $CURRENT_VIEW->{PATCH})) {
+	$CURRENT_VIEW->{STATE} = '';
+	return 1;
+    }
+
+    $patch = get_current_patch_ro();
+
+    if (!defined($hash = hash($patch))) {
+	$CURRENT_VIEW->{STATE} = '!';
+	$origin = get_current_origin();
+	return error("cannot read patch for '$origin' : $!");
+    }
+
+    if ($hash eq $CURRENT_VIEW->{HASH}) {
+	$CURRENT_VIEW->{STATE} = '';
+    } else {
+	$CURRENT_VIEW->{STATE} = '*';
+    }
+
+    return 1;
+}
+
+# Replace the current patch by a valid patch.
+# The backtrack can be full or partial.
+# In the former case, the current patch is restored to the diff between the
+# current view origin file and pacnew file.
+# In the latter case, the current patch is restored to the last current view
+# stable patch.
+#
+# Arg 0: 1 for a full backtrack, 0 otherwise.
+#
+# Return: 1 if backtrack happens normally, undef in an error occurs.
+#
+sub backtrack_current_patch
+{
+    my ($fully) = @_;
+    my ($patch, $stable, $origin, $result);
+
+    $stable = $CURRENT_VIEW->{STABLE};
+
+    if ($fully || !defined($stable)) {
+	if (defined($patch = $CURRENT_VIEW->{PATCH})) {
+	    unlink($patch);
+	    $CURRENT_VIEW->{PATCH} = undef;
+	}
+
+    	if (defined($stable)) {
+	    unlink($stable);
+	    $CURRENT_VIEW->{STABLE} = undef;
+	}
+    } else {
+	$patch = get_current_patch_ro();
+
+	if (!copy($stable, $patch)) {
+	    $origin = get_current_origin();
+	    backtrack_current_patch(1);
+	    return error("cannot restore patch for '$origin' : $!")
+	}
+    }
+
+    if (defined($result = $CURRENT_VIEW->{RESULT})) {
+	unlink($result);
+	$CURRENT_VIEW->{RESULT} = undef;
+    }
+
+    return 1;
+}
+
+# Return the current result of applying the current patch to origin.
+#
+# Return: The path of the result file in case of success, undef otherwise.
+#
+sub get_current_result
+{
+    my ($result, $origin, $patch);
+
+    if (defined($result = $CURRENT_VIEW->{RESULT})) {
+	return $result;
+    }
+
+    $origin = get_current_origin();
+    $patch = get_current_patch_ro();
+
+    if (!defined($result = patch($origin, $patch))) {
+	return undef;
+    }
+
+    $CURRENT_VIEW->{RESULT} = $result;
+
+    return $result;
+}
+
+
+# Other view functions ========================================================
+
+# The list of the views the user has previously jumped from.
+# This list is used as a FIFO.
+#
+my @OTHER_VIEWS;
+
+# Push the current view to the jumped list.
+# After the call, the current view is undefined.
+#
+sub push_current
+{
+    clean_current();
+    push(@OTHER_VIEWS, $CURRENT_VIEW);
+    $CURRENT_VIEW = undef;
+}
+
+# Poll a view from the jumped list and make it the current view.
+# If the current view is defined before the call, terminate it.
+#
+# Return: 1 on success, undef if the jumped list is empty.
+#
+sub poll_current
+{
+    my ($view);
+
+    $view = shift(@OTHER_VIEWS);
+
+    if (!defined($view)) {
+	return undef;
+    }
+
+    if (defined($CURRENT_VIEW)) {
+	terminate_current();
+    }
+
+    $CURRENT_VIEW = $view;
+
+    return 1;
+}
+
+# Terminate all views in the jumped list.
+# Remove all the temporary files created in the views sotred in the jumped
+# list.
+# The jumped list is empty when this call returns.
+#
+sub terminate_others
+{
+    my ($current, $view);
+
+    $current = $CURRENT_VIEW;
+
+    foreach $view (@OTHER_VIEWS) {
+	$CURRENT_VIEW = $view;
+	terminate_current();
+    }
+
+    @OTHER_VIEWS = ();
+
+    $CURRENT_VIEW = $current;
+}
+
+
+# Interface functions =========================================================
+
+# The list of possible user actions.
+# Each action in this list stores the following fields.
+#
+#   [0] => The key that the user types to make the action.
+#
+#   [1] => The description of the action, printed in the help menu.
+#
+#   [2] => The action availability.
+#          0 => The action is not available to the user.
+#          1 => The action is available to the user.
+#
+#   [3] => The function to call when the user make the action.
+#
+my @ACTIONS = (
+    [ 'a' , 'apply patch and remove pacnew file'    , 1 , \&apply     ],
+    [ 'e' , 'edit pacnew patch'                     , 0 , \&edit      ],
+    [ 'c' , 'cancel all patch editions'             , 0 , \&cancel    ],
+    [ 'z' , 'backtrack editions until valid patch'  , 0 , \&backtrack ],
+    [ 'v' , 'view result of pacnew patch'           , 1 , \&view      ],
+    [ 'o' , 'view original file'                    , 1 , \&original  ],
+    [ 'r' , 'remove pacnew file'                    , 1 , \&remove    ],
+    [ 's' , 'skip this file and let unchanged'      , 1 , \&skip      ],
+    [ 'j' , 'jump to next file and come back later' , 1 , \&jump      ],
+    [ 'q' , 'quit this program'                     , 1 , \&quit      ],
+    [ '?' , 'print help'                            , 1 , \&help      ]
+    );
+
+# The editor command to use for 'edit' action.
+#
+my $EDITOR = undef;
+
+# Enable or diable actions in the action list.
+#
+# Arg 0: 1 to enable, 0 to diable.
+# Args: The code of the actions to modify.
+#
+# Return: 1
+#
+sub enable_actions
+{
+    my ($availability, @actions) = @_;
+    my ($action, $code);
+
+    foreach $action (@ACTIONS) {
+	($code, $_, $_, $_) = @$action;
+
+	if (grep { $code eq $_ } @actions) {
+	    $action->[2] = $availability;
+	}
+    }
+
+    return 1;
+}
+
+# Update actions availability based on current view.
+# The following action conditions to be enabled are as follows.
+#
+#   'a' => The current patch has to be valid (state is '' or '*').
+#          The origin file must be writable.
+#
+#   'e' => The $EDITOR must be defined.
+#
+#   'c' => The current patch must have been edited (state is '*' or '!').
+#
+#   'z' => The current patch must be invalid (state is '!')
+#
+#   'v' => The current patch has to be valid (state is '' or '*').
+#
+#   'r' => The pacnew file must be removable (its directory must be writable).
+#
+# Return: 1
+#
+sub update_actions
+{
+    my ($state, $origin, $pacdir);
+
+    if (defined($EDITOR)) {
+	enable_actions(1, 'e');
+    } else {
+	enable_actions(0, 'e');
+    }
+
+    enable_actions(1, 'a', 'r');	
+
+    $state = get_current_state();
+
+    if ($state eq '') {
+	enable_actions(0, 'c', 'z');	
+	enable_actions(1, 'a', 'v');	
+    } elsif ($state eq '*') {
+	enable_actions(0, 'z');	
+	enable_actions(1, 'a', 'c', 'v');	
+    } elsif ($state eq '!') {
+	enable_actions(0, 'a', 'v');	
+	enable_actions(1, 'c', 'z');	
+    }
+
+    $origin = get_current_origin();
+
+    if (!(-w $origin)) {
+	enable_actions(0, 'a');	
+    }
+
+    $pacdir = $origin . '.pacnew';
+    $pacdir =~ s|^(.*/)[^/]+$|$1|;
+
+    if (!(-w $pacdir)) {
+	enable_actions(0, 'r');	
+    }
+
+    return 1;
+}
+
+# Indicate if all the specified actions are enabled.
+#
+# Args: the code of the actions to test.
+#
+# Return: 1 if all the actions associated to the given codes are enabled, 0 if
+#         at least one of them is diasbled.
+#
+sub is_action_enabled
+{
+    my (@actions) = @_;
+    my ($action, $code, $availability);
+
+    foreach $action (@ACTIONS) {
+	($code, $_, $availability, $_) = @$action;
+
+	if (!grep { $code eq $_ } @actions) {
+	    next;
+	}
+
+	if ($availability == 0) {
+	    return 0;
+	}
+    }
+
+    return 1;
+}
+
+# Print the help menu on the standard output.
+# For each enaled action, print the action code and the description.
+#
+# Return: 1
+#
+sub print_menu
+{
+    my ($action, $code, $description, $availability);
+
+    foreach $action (@ACTIONS) {
+	($code, $description, $availability, $_) = @$action;
+
+	if ($availability == 0) {
+	    next;
+	}
+
+	printf(" \033[34;1m%s\033[0m %s\n", $code, $description);
+    }
+
+    return 1;
+}
+
+# Print the short list of enabled options.
+# Print the enabled action codes without appending a newline character.
+#
+# Return: 1
+#
+sub print_shortmenu
+{
+    my ($action, $code, $availability, $sep);
+
+    $sep = '';
+
+    printf("\033[34;1m[");
+
+    foreach $action (@ACTIONS) {
+	($code, $_, $availability, $_) = @$action;
+
+	if ($availability == 0) {
+	    next;
+	}
+
+	printf("%s%s", $sep, $code);
+
+	$sep = ',';
+    }
+
+    printf("]\033[0m");
+
+    return 1;
+}
+
+# Print the current view state.
+# Print the current state character. If this character is not empty, append a
+# space character.
+# Do not append a newline character.
+#
+# Return: 1
+#
+sub print_state
+{
+    my ($state);
+
+    $state = get_current_state();
+
+    if ($state eq '') {
+	return 1;
+    }
+
+    if ($state eq '!') {
+	printf("\033[31;1m!\033[0m ");
+	return 1;
+    }
+
+    if ($state eq '*') {
+	printf("\033[33;1m*\033[0m ");
+	return 1;
+    }
+
+    printf("%s ", $state);
+
+    return 1;
+}
+
+# Print a waiting message on standard input that can be overriden.
+# The message can be overriden by calling clean_waiting_message().
+#
+# Return: 1
+#
+sub print_waiting_message
+{
+    printf("\033[32;1m==>\033[0;1m Looking for files...\033[0m\r");
+    local $| = 1;
+
+    return 1;
+}
+
+# Clear the previously printed waiting message.
+#
+# Return: 1
+#
+sub clean_waiting_message
+{
+    printf("                         \r");
+    local $| = 1;
+
+    return 1;
+}
+
+# Print the prompt message on the standard output.
+#
+# Return: 1
+#
+sub print_prompt
+{
+    my ($origin);
+
+    $origin = get_current_origin();
+
+    printf("\033[34;1m::\033[0;1m %s\033[0m ", $origin);
+    print_state();
+    print_shortmenu();
+
+    printf(" ");
+
+    local $| = 1;
+
+    return 1;
+}
+
+# Print the prompt on standard output and read action code from standard input.
+# Continue to read standard input while the read action code is invalid.
+#
+# Return: A valid action code or undef if end of stream has been reached on
+#         stdin.
+#
+sub get_next_action
+{
+    my ($code, $action, $acode, $availability, $function);
+
+  read_loop:
+    while (1) {
+	print_prompt();
+
+	$code = <STDIN>;
+
+	if (!defined($code)) {
+	    return undef;
+	}
+
+	chomp($code);
+
+	foreach $action (@ACTIONS) {
+	    ($acode, $_, $availability, $function) = @$action;
+
+	    if (lc($code) ne $acode) {
+		next;
+	    }
+
+	    if ($availability == 0) {
+		error("Action '$code' is not available");
+		next read_loop;
+	    }
+
+	    return $function;
+	}
+
+	error("Unknown action '$code'");
+    }
+}
+
+# Print an error message on standard output.
+#
+# Arg 0: The message to print.
+#
+# Return: undef
+#
+sub error
+{
+    my ($message) = @_;
+
+    printf("\033[31;1m!!\033[0m %s\n", $message);
+
+    return undef;
+}
+
+# Print warning message on standard output.
+#
+# Arg 0: The message to print.
+#
+# Return: undef
+#
+sub warning
+{
+    my ($message) = @_;
+
+    printf("\033[33;1m!!\033[0m %s\n", $message);
+
+    return undef;
+}
+
+
+# Main functions ==============================================================
+
+# The finder command to use to find pacnew files.
+# This is a list of shell words to give to exec.
+#
+my $FINDER          = undef;
+
+# Indicate if the standard error stream of the finder command should be
+# redirected to /dev/null.
+#
+my $FINDER_WARNINGS = undef;
+
+# Indicate if a pacnew file has been skipped because of insufficient
+# privileges.
+#
+my $SKIPPED         = 0;
+
+
+# Clean all generated temporary files.
+#
+# Return: 1
+#
+sub onexit
+{
+    terminate_current();
+    terminate_others();
+
+    return 1;
+}
+
+# Ensure to call onexit() when the interpreter exits.
+#
+END
+{
+    onexit();
+}
+
+
+# The 'a' action function. - - - - - - - - - - - - - - - - - - - - - - - - - - 
+#
+sub apply
+{
+    my ($origin, $result, $pacnew);
+
+    $origin = get_current_origin();
+    $result = get_current_result();
+    $pacnew = $origin . '.pacnew';
+
+    if (!copy($result, $origin)) {
+	return error("Cannot apply patch to '$origin' : $!");
+    }
+
+    unlink($pacnew);
+    terminate_current();
+}
+
+# The 'e' action function. - - - - - - - - - - - - - - - - - - - - - - - - - - 
+#
+sub edit
+{
+    my ($patch, $valid);
+
+    if (!defined($patch = get_current_patch_rw())) {
+	return;
+    }
+
+    system($EDITOR, $patch);
+
+    if (defined(get_current_result())) {
+	$valid = 1;
+    } else {
+	$valid = 0;
+    }
+
+    validate_current_patch($valid);
+}
+
+# The 'c' action function. - - - - - - - - - - - - - - - - - - - - - - - - - - 
+#
+sub cancel
+{
+    backtrack_current_patch(1);
+
+    validate_current_patch(1);
+}
+
+# The 'z' action function. - - - - - - - - - - - - - - - - - - - - - - - - - - 
+#
+sub backtrack
+{
+    backtrack_current_patch(0);
+
+    validate_current_patch(1);
+}
+
+# The 'v' action function. - - - - - - - - - - - - - - - - - - - - - - - - - - 
+#
+sub view
+{
+    my ($result);
+
+    if (!defined($result = get_current_result())) {
+	return;
+    }
+
+    cat($result);
+}
+
+# The 'o' action function. - - - - - - - - - - - - - - - - - - - - - - - - - - 
+#
+sub original
+{
+    my ($origin);
+
+    $origin = get_current_origin();
+
+    cat($origin);
+}
+
+# The 'r' action function. - - - - - - - - - - - - - - - - - - - - - - - - - - 
+#
+sub remove
+{
+    my ($origin, $pacnew);
+
+    $origin = get_current_origin();
+    $pacnew = $origin . '.pacnew';
+
+    if (!unlink($pacnew)) {
+	return error("Cannot remove pacnew for '$origin' : $!");
+    }
+
+    terminate_current();
+}
+
+# The 's' action function. - - - - - - - - - - - - - - - - - - - - - - - - - - 
+#
+sub skip
+{
+    terminate_current();
+}
+
+# The 'j' action function. - - - - - - - - - - - - - - - - - - - - - - - - - - 
+#
+sub jump
+{
+    push_current();
+}
+
+# The 'q' action function. - - - - - - - - - - - - - - - - - - - - - - - - - - 
+#
+sub quit
+{
+    exit (0);
+}
+
+# The '?' action function. - - - - - - - - - - - - - - - - - - - - - - - - - - 
+#
+sub help
+{
+    print_menu();
+}
+
+
+# Execute the interaction loop for a given current view.
+# While the current view is defined, prompt the user for an action to do, then
+# do the action.
+# If the current view has an origin file which cannot be modified or a pacnew
+# file which cannot be removed, skip the file.
+#
+# Return: 1
+#
+sub action_loop
+{
+    my ($action, $origin);
+
+    while (is_current_defined()) {
+	update_actions();
+
+	if (!is_action_enabled('a', 'e')) {
+	    $origin = get_current_origin();
+
+	    if (($SKIPPED == 0) && !is_action_enabled('a', 'r')) {
+		warning("Insufficient privileges for '" . $origin .
+			"', skipping files...");
+	    }
+
+	    $SKIPPED = 1;
+
+	    skip();
+	    last;
+	}
+
+	$action = get_next_action();
+
+	if (!defined($action)) {
+	    $action = \&quit;
+	}
+
+	$action->();
+    }
+
+    return 1;
+}
+
+# Invoke the finder command and execute the interaction loop on each result
+# ending with the '.pacnew' extension.
+# For each result the the finder command, initialize the current view with the
+# origin file corresponding to the result, then call the interaciton loop.
+#
+# Return: 1
+#
+sub primary_loop
+{
+    my ($pid, $ifh, $tfh, $fh, $line);
+
+    if (!pipe($ifh, $tfh)) {
+	fatal("cannot setup find process : $!");
+    }
+
+    if (($pid = fork()) == 0) {
+	close($ifh);
+	open(\*STDOUT, '>&', $tfh);
+
+	if ($FINDER_WARNINGS == 0) {
+	    open(\*STDERR, '>', '/dev/null');
+	}
+
+	exec (@$FINDER);
+
+	exit (1);
+    }
+
+    close($tfh);
+
+    print_waiting_message();
+
+    while (defined($line = <$ifh>)) {
+	clean_waiting_message();
+
+	chomp($line);
+
+	if (!($line =~ m|^(.*)\.pacnew$|)) {
+	    next;
+	}
+
+	initialize_current($1);
+
+	action_loop();
+
+	print_waiting_message();
+    }
+
+    clean_waiting_message();
+
+    close($ifh);
+
+    waitpid($pid, 0);
+
+    return 1;
+}
+
+# Execute the interaction loop on each view in the jumped list.
+# Poll the oldest view in the jumped list, set it as the current view and
+# invoke the interaction loop on it.
+# Repeat while the jump list is not empty.
+#
+# Return: 1
+#
+sub secondary_loop
+{
+    poll_current();
+
+    while (is_current_defined()) {
+    	action_loop();
+	poll_current();
+    }
+
+    return 1;
+}
+
+
+# Main program ================================================================
+
+# Return the usage message.
+#
+# Return: A string which is the usage message.
+#
+sub usage
+{
+    return <<"EOF";
+Usage: $0 [<options...>]
+
+Look for '.pacnew' files in the system and attempt to merge them with their
+original files through an interactive loop.
+
+The user controls if the merge happens with the possibility to edit the changes
+applied to the original file or to not merge at all.
+
+Options:
+
+  -e <cmd>, --editor=<cmd>      Set what editor to use for patch editing.
+                                Default is the environment variable EDITOR.
+
+  -f <cmd>, --finder=<cmd>      Set what command to use to find pacnew files.
+                                Default is 'locate' if available, else 'find'.
+
+  -h, --help                    Print this message and exit.
+
+  -V, --version                 Print version information and exit.
+
+  --finder-warning=[show|hide]  Show what the finder command prints on stderr.
+                                Default is 'hide' when 'find' is the finder and
+                                'show' otherwise.
+EOF
+}
+
+# Return the version information.
+#
+# Return: A string which is the version information.
+#
+sub version
+{
+    return <<"EOF";
+$PROGNAME $VERSION
+$AUTHOR
+$EMAIL
+EOF
+}
+
+# Set the $EDITOR variable.
+# If an editor is specified, try to set $EDITOR to this editor or fail.
+# Otherwise try to set $EDITOR to the environment variable EDITOR.
+# If this does not work, try to set $EDITOR with the commands in the @EDITOR
+# list, or fail.
+#
+# Arg 0: The command name to set $EDITOR to.
+#
+# Return: 1 if the $EDITOR has been set, 0 otherwise.
+#
+sub select_editor
+{
+    my ($opteditor) = @_;
+    my ($editor);
+
+    if (defined($opteditor)) {
+	if (which($opteditor)) {
+	    $EDITOR = $opteditor;
+	    return 1;
+	} else {
+	    return 0;
+	}
+    }
+
+    if (defined($ENV{EDITOR}) && ($ENV{EDITOR} ne '')) {
+	if (which($ENV{EDITOR})) {
+	    $EDITOR = $ENV{EDITOR};
+	    return 1;
+	} else {
+	    return 0;
+	}
+    }
+
+    foreach $editor (@EDITORS) {
+	if (which($editor)) {
+	    $EDITOR = $editor;
+	    return 1;
+	}
+    }
+
+    return 0;
+}
+
+# Set the $FINDER command.
+# If a finder is specified, parse it shell-style and try to set $FINDER to this
+# command or fail.
+# Otherwise tryto set $FINDER to one of the commands in the @FINDERS list, or
+# fail.
+#
+# Arg 0: The command to set $FINDER to.
+#
+# Return: 1 if the $FINDER has been set, 0 otherwise.
+#
+sub select_finder
+{
+    my ($optfinder) = @_;
+    my ($finder);
+
+    if (defined($optfinder)) {
+	$finder = [ shellwords($optfinder) ];
+	if (which($finder->[0])) {
+	    $FINDER = $finder;
+	    return 1;
+	} else {
+	    return 0;
+	}
+    }
+
+    foreach $finder (@FINDERS) {
+	if (which($finder->[0])) {
+	    $FINDER = $finder;
+	    return 1;
+	}
+    }
+
+    return 0;
+}
+
+# Print an error message on standard error and exit with a failure code.
+#
+# Arg 0: The error message to print.
+#
+# Return: never
+#
+sub fatal
+{
+    my ($message) = @_;
+
+    if (!defined($message)) {
+	$message = 'undefined error';
+    }
+
+    printf(STDERR "%s: %s\n", $PROGNAME, $message);
+    printf(STDERR "Please type '%s --help' for more information\n", $0);
+
+    exit (1);
+}
+
+# Main function.
+# Parse the options and set the global variables.
+# Invoke the finder command then execute the interact loop while there are
+# origin files to process.
+#
+# Return: the program exit code.
+#
+sub main
+{
+    my ($editor, $finder, $warn, $finder_warnings);
+
+    $warn = $SIG{__WARN__};
+    $SIG{__WARN__} = sub {
+	my ($message) = @_;
+
+	if ($message =~ m|Unknown option: (.*)$|) {
+	    $message = $1;
+	    fatal("unknown option: '" . $message . "'");
+	}
+
+	fatal("unknown option parsing error");
+    };
+    GetOptionsFromArray(
+	\@_,
+	'e|editor=s'        => \$editor,
+	'f|finder=s'        => \$finder,
+	'h|help'            => sub { printf("%s", usage()); exit (0); },
+	'V|version'         => sub { printf("%s", version()); exit (0); },
+	'finder-warnings=s' => \$finder_warnings
+	);
+    $SIG{__WARN__} = $warn;
+
+    if (@_) {
+	fatal("unexpected operand '" . shift(@_) . "'");
+    }
+
+    if (!select_editor($editor)) {
+	if (defined($editor)) {
+	    fatal("cannot find editor '" . $editor . "'");
+	} else {
+	    warning("Cannot find editor, please use '-e' option or set " .
+		    "EDITOR environment.");
+	}
+    }
+
+    if (!select_finder($finder)) {
+	fatal("cannot find finder '" . $finder . "'");
+    }
+
+    if (defined($finder_warnings)) {
+	if (grep { lc($finder_warnings) eq $_ }
+	    qw(show true yes always y t 1)) {
+	    $FINDER_WARNINGS = 1;
+	} elsif (grep { lc($finder_warnings) eq $_ }
+		 qw(hide false no never n f 0)) {
+	    $FINDER_WARNINGS = 0;
+	} else {
+	    fatal("unknown value for finder-warnings option : '" .
+		  $finder_warnings . "'");
+	}
+    } else {
+	if ($FINDER->[0] eq 'find') {
+	    $FINDER_WARNINGS = 0;
+	} else {
+	    $FINDER_WARNINGS = 1;
+	}
+    }
+
+    primary_loop();
+
+    secondary_loop();
+
+    return 0;
+}
+
+
+exit (main(@ARGV));
+__END__
