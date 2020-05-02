@@ -1280,6 +1280,12 @@ sub primary_loop
 	    next;
 	}
 
+	# Dubious finder or outdated locate db
+	#
+	if (!(-f $line)) {
+	    next;
+	}
+
 	initialize_current($1);
 
 	action_loop();
