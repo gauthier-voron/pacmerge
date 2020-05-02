@@ -40,3 +40,7 @@ editor is required to edit patches.
   * patch
   * locate (optional)
   * find (optional)
+
+The script also uses a non core perl module.
+
+  * File::Which
