@@ -1208,12 +1208,14 @@ sub help
 #
 sub action_loop
 {
-    my ($action, $origin);
+    my ($action, $origin, $first);
+
+    $first = 1;
 
     while (is_current_defined()) {
 	update_actions();
 
-	if (!is_action_enabled('a', 'e')) {
+	if ($first && !is_action_enabled('a', 'e')) {
 	    $origin = get_current_origin();
 
 	    if (($SKIPPED == 0) && !is_action_enabled('a', 'r')) {
@@ -1226,6 +1228,8 @@ sub action_loop
 	    skip();
 	    last;
 	}
+
+	$first = 0;
 
 	$action = get_next_action();
 
